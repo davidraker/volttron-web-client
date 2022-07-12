@@ -130,7 +130,8 @@ class Agent(Http):
     def status(self) -> AgentStatus:
         response = self.get(url=f"{self.link}/status")
         obj = response.json()
-        context = AgentStatus(identity=self.identity,
+        context = AgentStatus(name=obj['name'],
+                              identity=self.identity,
                               platform=self.platform,
                               exit_code=obj['exit_code'],
                               priority=obj['priority'],
@@ -147,6 +148,7 @@ class Agent(Http):
 
 @dataclass
 class AgentStatus:
+    name: str
     identity: str
     platform: str
     uuid: str
