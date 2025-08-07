@@ -42,7 +42,8 @@ class Platform(Http):
                 if response.ok:
                     links = build_links(response.json()[LINK_IDENTIFIER])
                     for link in links:
-                        agent_list.append(Agent(platform=self.name, identity=link.key, link=link.link))
+                        agent_list.append(Agent(platform=self.name, identity=link.key, link=link.link,
+                                                links=links))
                     break
         return agent_list
 
@@ -60,6 +61,7 @@ class Platform(Http):
                                                 exit_code=v['exit_code'],
                                                 priority=v['priority'],
                                                 running=v['running'],
+                                                enabled=v['enabled'],
                                                 tag=v['tag'],
                                                 uuid=v['uuid']))
         return status.json()
@@ -68,7 +70,9 @@ class Platform(Http):
         response = self.get(f"/vui/platforms/{self.name}/agents/{identity}")
         agent: Optional[Agent] = None
         if response.ok:
-            agent = Agent(self.name, identity=identity, link=f"/vui/platforms/{self.name}/agents/{identity}")
+            links = build_links(response.json()[LINK_IDENTIFIER])
+            agent = Agent(self.name, identity=identity, link=f"/vui/platforms/{self.name}/agents/{identity}",
+                          links=links)
         else:
             raise InvalidAgentReference()
         return agent
@@ -118,13 +122,21 @@ class Agent(Http):
     platform: str
     identity: str
     link: str
+    links: List[Link]
 
     @property
-    def configs(self) -> Configs:
-        response = self.get(self.link)
+    def configs(self) -> AgentConfigs:
+        response = self.get(url=f'{self.link}/configs')
         links = build_links(response.json()[LINK_IDENTIFIER])
-        configs = Configs(identity=self.identity, links=links)
+        configs = AgentConfigs(identity=self.identity, link=f'{self.link}/configs', links=links)
         return configs
+
+    @property
+    def enabled(self) -> AgentEnabled:
+        response = self.get(url=f'{self.link}/enabled')
+        status = response.json()['status']
+        priority = response.json()['priority']
+        return AgentEnabled(enabled=bool(status), priority=priority)
 
     @property
     def status(self) -> AgentStatus:
@@ -136,14 +148,24 @@ class Agent(Http):
                               exit_code=obj['exit_code'],
                               priority=obj['priority'],
                               running=obj['running'],
+                              enabled=obj['enabled'],
                               tag=obj['tag'],
                               uuid=obj['uuid'])
-
         return context
 
     @property
     def rpc(self) -> AgentRPC:
-        return self.configs.rpc
+        response = self.get(url=f'{self.link}/rpc')
+        rpc: Optional[AgentRPC] = None
+        if response.ok:
+            links = build_links(response.json()[LINK_IDENTIFIER])
+            rpc = AgentRPC(links)
+        return rpc
+
+    @property
+    def running(self) -> bool:
+        response = self.get(url=f'{self.link}/running')
+        return response.json()['running']
 
 
 @dataclass
@@ -152,11 +174,12 @@ class AgentStatus:
     identity: str
     platform: str
     uuid: str
+    running: bool
+    enabled: bool
     pid: Optional[str] = None
-    running: bool = False
     tag: Optional[str] = ''
     exit_code: Optional[str] = None
-    priority: Optional[str] = None
+    priority: Optional[int] = None
 
 
 class Historian:
@@ -185,8 +208,9 @@ def get_link(key: str, links: List[Link]) -> Link:
 
 
 @dataclass
-class Configs(Http):
+class AgentConfigs(Http):
     identity: str
+    link: str
     links: List[Link]
 
     def __get_link__(self, key) -> Optional[Link]:
@@ -196,60 +220,42 @@ class Configs(Http):
         return None
 
     @property
-    def running(self) -> bool:
-        response = self.get(self.__get_link__('enabled').link)
-        return cbool(response.json()['status'])
-
-    @property
-    def rpc(self) -> AgentRPC:
-        response = self.get(self.__get_link__('rpc').link)
-        rpc: Optional[AgentRPC] = None
-        if response.ok:
-            links = build_links(response.json()[LINK_IDENTIFIER])
-            rpc = AgentRPC(links)
-
-        return rpc
-
-    @property
-    def status(self):
-        response = self.get(self.__get_link__('enabled').link)
-        return response.json()
-
-    @property
-    def enabled(self) -> AgentEnabled:
-        response = self.get(self.__get_link__('enabled').link)
-        status = response.json()['status']
-        if status.lower() == 'true':
-            status = True
-        elif status.lower() == 'false':
-            status = False
-        priority = response.json()['priority']
-        if priority == 'None':
-            priority = None
-        else:
-            priority = int(priority)
-        return AgentEnabled(enabled=bool(status), priority=priority)
-
-    def set_enabled(self, enabled: bool, priority: int = 50):
-        if enabled:
-            response = self.put(self.__get_link__('enabled').link, params={'priority': priority})
-        else:
-            response = self.delete(self.__get_link__('enabled').link)
-
-    def set_priority(self, priority: int):
-        self.set_enabled(True, priority)
-
-
-class ConfigStoreEntry(Http):
-    link: Optional[Link] = None
-    content: Optional[str] = None
-    content_type: Optional[str] = None
+    def entries(self) -> List[ConfigStoreEntry]:
+        entry_list: List[ConfigStoreEntry] = []
+        for link in self.links:
+            response = self.get(link.link)
+            if response.ok:
+                key = link.link.replace(f'{self.link}/', '')
+                entry_list.append(ConfigStoreEntry(link=link.link, key=key, content=response.json(),
+                                                   content_type=response.headers.get('Content-Type')))
+        return entry_list
 
 
 @dataclass
-class AgentEnabled:
+class ConfigStoreEntry(Http):
+    link: str
+    key: str
+    content: Optional[str] = None
+    content_type: Optional[str] = None
+
+    def update(self, new_entry):
+        self.put(self.link, data=new_entry)
+
+
+@dataclass
+class AgentEnabled(Http):
+    link: str
     enabled: bool
     priority: Optional[int] = 0
+
+    def update_enabled(self, enabled: bool, priority: int = 50):
+        if enabled:
+            response = self.put(self.link, params={'priority': priority})
+        else:
+            response = self.delete(self.enabled.link)
+
+    def update_priority(self, priority: int):
+        self.update_enabled(True, priority)
 
 
 @dataclass
